@@ -10,18 +10,15 @@ my $t = "\t";
 my $T = "\t";
 my $n = 1;
 my $N = 1;
-my $a = '*';
-my @append = ();
-my $A = '*';
-my @Append = ();
-my $A = '*';
+my @seq;
 my $q = '"';
 my $Q = '"';
-my $inner_join = 1;
+my $join = 'inner';
 my $print_heading = 1;
 my @heading = ();
 my @Heading = ();
 my $verbose = 0;
+my $debug = 1;
 
 if($ARGV[0] eq '-h' or $ARGV[0] eq '-H' or $ARGV[0] eq '--help' or $ARGV[0] eq '-help')
 {
@@ -30,6 +27,7 @@ if($ARGV[0] eq '-h' or $ARGV[0] eq '-H' or $ARGV[0] eq '--help' or $ARGV[0] eq '
 }
 
 read_options(@ARGV);
+
 my $mem_file = check_smaller_file($f, $F);
 
 my $key_based_data = read_file($mem_file, $t, $n);
@@ -37,7 +35,7 @@ print_joined_data($key_based_data, $F, $T, $N);
 
 sub show_help
 {
-	print "Syntax: $0 file1 file2 <OPTIONS>\n";
+	print "Syntax: $0 file1 FILE2 <OPTIONS>\n";
 	print qq"OPTIONS:
 	-t<separator char for first file (default: tab)>
 	-T<separator char for second file (default: tab)> 
@@ -47,18 +45,24 @@ sub show_help
 	-A <1,2,3,4,5 OR 1-5 OR 1-3,4,5 (default: all columns)> 
 	-q <quote character for a field (default: \")>  # PENDING
 	-Q <quote character for a field (default: \")>  # PENDING
+
+	-seq <sequence of columns from both files in output, example: f1,F3,f2,F4-5,f3,5 (default f*,F*)
 	-v <verbose output? 0/1> (default: 0)  # PENDING
 	-o <output file name> (default: STDOUT)  # PENDING
-	-i <inner join? 0/1> (default: 1)
+	-j <type of join> <inner,right> (default: inner)
 	-H <print heading (first line)? 0/1 (default: 1)> # PENDING
 
 	* TODO: -a and -A options just ask the column numbers and not the ordering. Replace it with a better option
+	* TODO: currently smaller size file becomes key-based-data file and output is ordered by the data present in the larger file. if size is same for both files first file becomes key-based-data file
+	* TODO: Logging level to be according to log level
+	* TODO: common key (-n, -N) can be represented as column name also
 "
 }
 
-sub verbose
+sub log
 {
 	my $msg = shift;
+	my $level = shift;
 	if($verbose)
 	{
 		print $msg."\n";
@@ -81,56 +85,51 @@ sub read_options
 			$N = 0 + shift;
 			die "N <field sequency number for second file> starts from 1 and hence only a positive integer value is allowed" if($N < 1);
 		}
-		if($_ eq '-a')
+		# args => array
+		# f1F2 => ['f1', 'F2']
+		# f1,3,F2-4 => ['f1','f3','F2','F3','F4']
+		# f1,f3,F2-4 => ['f1','f3','F2','F3','F4']
+		# f1,F2,f3,F4 => ['f1','F2','f3','F4']
+		if($_ eq '-seq')
 		{
-			$a = shift;
-			@append = split(',', $a);
-			for(my $i=0;$i<=$#append;$i++)
+			my $seq = shift;
+			if($seq !~ /^f[0-9,*f-]+$/i)
 			{
-				if($append[$i] =~ /^\d+$/)
+				die "Value of sequence is not appropriate. Please see help ($0 -h)";
+			}
+			# check for comma separated values of columns
+			my @sequence = split(',', $seq);
+			my $file = '';
+			for(my $i=0;$i<=$#sequence;$i++)
+			{
+				# check file (f OR F)
+				if($sequence[$i] =~ s/^(f|F)//)
 				{
-					;
+					$file = $1;
 				}
-				elsif($append[$i] =~ /^(\d+)-(\d+)$/)
+				if($sequence[$i] =~ /^\d+$/)
+				{
+					push @seq, $file.$sequence[$i];
+				}
+				elsif($sequence[$i] =~ /^(\d+)-(\d+)$/)
 				{
 					my @vals = ($1..$2);
-					splice(@append, $i, 0, @vals);
+					push @seq, map {$file.$_} @vals;
 				}
 				else
 				{
-					die "Allowed values for -a are: 1,2,3,4,5 OR 1,2-4,5 OR 1-5";
+					die "Allowed values for -seq are: 1,2,3,4,5 OR 1,2-4,5 OR 1-5";
 				}
 			}
 		}
-		if($_ eq '-A')
+		if($_ eq '-j')
 		{
-			$A = shift;
-			@Append = split(',', $A);
-			for(my $i=0;$i<=$#Append;$i++)
-			{
-				if($Append[$i] =~ /^\d+$/)
-				{
-					;
-				}
-				elsif($Append[$i] =~ /^(\d+)-(\d+)$/)
-				{
-					my @vals = ($1..$2);
-					splice(@Append, $i, 0, @vals);
-				}
-				else
-				{
-					die "Allowed values for -A are: 1,2,3,4,5 OR 1,2-4,5 OR 1-5";
-				}
-			}
-			@Append = map {$_ - 1} @Append;
-		}
-		if($_ eq '-i')
-		{
-			$inner_join = shift;
+			$join = lc shift;
 		}
 		if($_ eq '-v')
 		{
-			$verbose = (shift + 0)?1:0;
+			$verbose = shift;
+			$verbose = ($verbose)?1:0;
 		}
 	}
 	# return error if two file nameas are not passed
@@ -140,8 +139,14 @@ sub read_options
 sub check_smaller_file
 {
 	my ($f1, $f2) = @_;
-	# add logic to find file size and return smaller file
-	# currently returning first file blindly
+
+	# following code is commented because in case $f2 is returned, the calling of print_joined_data need to be corrected
+	# TODO: leaving above item for later.
+	# TODO: left right join handling will also be required if we are chosing key_based_data file according to size and not according to left or right position
+	# if(-s $f1 > -s $f2)
+	# {
+	# 	return $f2;
+	# }
 	return $f1;
 }
 
@@ -194,43 +199,86 @@ sub print_joined_data
 		chomp($line);
 		@Heading = split($T, $line, -1);
 
-		print("@Heading");
-		print("$T");
-		if(scalar(@Append))
+		my @hseq = ();
+		for(@seq)
 		{
-			print("@heading[@Append]");
-		}
-		else
-		{
-			print("@heading");
-		}
-		print($/);
-	}
-	while(<FH>)
-	{
-		chomp;
-		# mentioned third argument here to avoid trimming of trailing whitespaces
-		my @f = split($T, $_, -1);
-		# handle here if tab character is inside quote string field value should include that
-		#
-
-		if($key_based_data->{$f[$N-1]})
-		{
-			print("@f");
-			print("$T");
-			if(scalar(@Append))
+			my $file;
+			my $index;
+		       	if(/^(f|F)([1-9]\d*)$/)
 			{
-				print("@{$key_based_data->{$f[$N-1]}}[@Append]");
+				$file = $1;
+				$index = $2 - 1;
 			}
 			else
 			{
-				print("@{$key_based_data->{$f[$N-1]}}");
+				die "Wrong sequence value $_\n";
 			}
-			print($/);
+			if($file eq 'f')
+			{
+				push @hseq, $heading[$index];
+			}
+			else
+			{
+				push @hseq, $Heading[$index];
+			}
+		}
+		print("@hseq");
+		print($/);
+	}
+	# print Dumper($key_based_data);
+	while(<FH>)
+	{
+		chomp;
+		# print "===========================================\n";
+		# mentioned third argument here to avoid trimming of trailing whitespaces
+		my @fields = split($T, $_, -1);
+		# print "fields:@fields:\n";
+		# handle here if tab character is inside quote string field value should include that
+		#
+
+		my $can_join = '';
+		# if common id exists
+		if($key_based_data->{$fields[$N-1]})
+		{
+			$can_join = 'left inner right';
 		}
 		else
 		{
-			print("@f$/") unless($inner_join);
+			$can_join = 'right';
+		}
+		# print "seq:@seq:\n";
+		my @dseq = ();
+		for(@seq)
+		{
+			# print "seq:$_:\n";
+			my $file;
+			my $index;
+			if(/^(f|F)([1-9]\d*)$/)
+			{
+				$file = $1;
+				$index = $2 - 1;
+			}
+			else
+			{
+				die "Wrong sequence value $_\n";
+			}
+
+			if($file eq 'f')
+			{
+				# print "pushing:$key_based_data->{$fields[$N-1]}->[$index]:\n";
+				push @dseq, ($key_based_data->{$fields[$N-1]}->[$index] || '');
+			}
+			else
+			{
+				# print "pushing:$fields[$index]:\n";
+				push @dseq, $fields[$index];
+			}
+		}
+		# print "can_join:$can_join:, join:$join\n";
+		if($can_join =~ /\b$join\b/)
+		{
+			print("@dseq");
+			print($/);
 		}
 	}
 }
